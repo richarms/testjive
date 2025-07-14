@@ -6,13 +6,22 @@ import time
 # Configuration
 DEST_IP = '10.8.81.20'
 DEST_PORT = 50000
-SAMPLE_RATE = 2e6
-FRAME_DURATION = 1e-3    # VDIF frame duration: 1ms
+
+# Use 64 MHz sampling with 20000 samples per frame.  The frame duration is
+# derived from these two values and is therefore ~0.3125 ms.
+SAMPLE_RATE = 64e6
+SAMPLES_PER_FRAME = 20000
+FRAME_DURATION = SAMPLES_PER_FRAME / SAMPLE_RATE
+FRAMES_PER_SECOND = int(SAMPLE_RATE / SAMPLES_PER_FRAME)
+
 BITS_PER_SAMPLE = 2      # 2-bit quantization
 CHANNELS = 1
 THREAD_ID = 0            # VDIF thread ID
 STATION_ID = 'AA'        # 2-char station ID
-PAYLOAD_SIZE = 8000      # VDIF payload size (in bytes per frame)
+
+# Compute payload size based on number of samples and quantisation depth
+# (ceil to full bytes).
+PAYLOAD_SIZE = (SAMPLES_PER_FRAME * BITS_PER_SAMPLE + 7) // 8
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
@@ -61,15 +70,18 @@ def generate_payload(samples):
     return packed
 
 def generate_and_send_frames(duration_seconds=2):
-    samples_per_frame = int(SAMPLE_RATE * FRAME_DURATION)
+    # Number of samples in each frame is fixed by configuration
+    samples_per_frame = SAMPLES_PER_FRAME
     epoch_start = int(time.time())
-    num_frames = int(duration_seconds / FRAME_DURATION)
+    num_frames = int(duration_seconds * FRAMES_PER_SECOND)
 
-    t = np.arange(samples_per_frame) / SAMPLE_RATE
+    # Use continuous time base so that the tone does not reset each frame
+    t0 = np.arange(samples_per_frame) / SAMPLE_RATE
     frequency = 1e6
 
     for frame_num in range(num_frames):
-        epoch_seconds = epoch_start + int(frame_num * FRAME_DURATION)
+        epoch_seconds = epoch_start + frame_num // FRAMES_PER_SECOND
+        t = t0 + (frame_num * samples_per_frame) / SAMPLE_RATE
 
         # Generate sine wave with noise
         signal = np.sin(2 * np.pi * frequency * t) + np.random.normal(0, 0.2, samples_per_frame)
@@ -81,7 +93,8 @@ def generate_and_send_frames(duration_seconds=2):
         payload = generate_payload(quantized_signal)[:PAYLOAD_SIZE]
 
         # VDIF Header
-        header = create_vdif_header(epoch_seconds, frame_num)
+        frame_in_second = frame_num % FRAMES_PER_SECOND
+        header = create_vdif_header(epoch_seconds, frame_in_second)
 
         # Full frame
         vdif_frame = header + payload
