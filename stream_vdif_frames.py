@@ -2,6 +2,7 @@ import numpy as np
 import socket
 import struct
 import time
+from datetime import datetime
 
 # Configuration
 DEST_IP = '10.8.81.20'
@@ -18,6 +19,7 @@ BITS_PER_SAMPLE = 2      # 2-bit quantization
 CHANNELS = 1
 THREAD_ID = 0            # VDIF thread ID
 STATION_ID = 'AA'        # 2-char station ID
+VDIF_VERSION = 1
 
 # Compute payload size based on number of samples and quantisation depth
 # (ceil to full bytes).
@@ -25,35 +27,44 @@ PAYLOAD_SIZE = (SAMPLES_PER_FRAME * BITS_PER_SAMPLE + 7) // 8
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-def create_vdif_header(epoch_seconds, frame_number):
-    # Simple VDIF header (as per VDIF specification==32 bytes?)
+# Reference epoch calculation: number of 6 month periods since
+# 1 Jan 2000 00:00 UTC as required by the VDIF specification.
+def reference_epoch_from_seconds(epoch_seconds: int) -> int:
+    epoch = datetime.utcfromtimestamp(epoch_seconds)
+    half = 0 if epoch.month <= 6 else 1
+    return (epoch.year - 2000) * 2 + half
+
+def create_vdif_header(epoch_seconds: int, frame_number: int) -> bytearray:
+    """Construct a 32-byte VDIF header according to the specification."""
     header = bytearray(32)
 
-    # Word 0: seconds from reference epoch (30 bits), legacy mode = 0
-    struct.pack_into('>I', header, 0, epoch_seconds & 0x3FFFFFFF)
+    # Word 0: invalid=0, legacy=0, seconds from reference epoch
+    word0 = epoch_seconds & 0x3FFFFFFF
+    struct.pack_into('<I', header, 0, word0)
 
-    # Word 1: frame number within second, log2 channels-1, bits/sample-1, thread ID
-    word1 = ((frame_number & 0xFFFFFF) << 8) | ((int(np.log2(CHANNELS)) & 0x1F) << 3) | ((BITS_PER_SAMPLE-1) & 0x07)
-    struct.pack_into('>I', header, 4, word1)
+    # Word 1: reference epoch and frame number within the second
+    ref_epoch = reference_epoch_from_seconds(epoch_seconds)
+    word1 = ((ref_epoch & 0x3F) << 24) | (frame_number & 0x00FFFFFF)
+    struct.pack_into('<I', header, 4, word1)
 
-    # Word 2: Station ID (ASCII), VDIF version, Data type = 0 (real data)
-    word2 = (ord(STATION_ID[0]) << 24) | (ord(STATION_ID[1]) << 16) | (1 << 8)
-    struct.pack_into('>I', header, 8, word2)
-
-    # Word 3: Frame length (units of 8 bytes), complex=0, bits/sample-1
+    # Word 2: VDIF version, log2 channels, frame length (in units of 8 bytes)
     frame_length_units = (len(header) + PAYLOAD_SIZE) // 8
-    word3 = (frame_length_units & 0xFFFFFF) << 8
-    struct.pack_into('>I', header, 12, word3)
+    word2 = ((VDIF_VERSION & 0x7) << 29) | ((int(np.log2(CHANNELS)) & 0x1F) << 24) | (frame_length_units & 0x00FFFFFF)
+    struct.pack_into('<I', header, 8, word2)
+
+    # Word 3: data type=0 (real), bits/sample-1, thread id, station id
+    station = (ord(STATION_ID[0]) << 8) | ord(STATION_ID[1])
+    word3 = ((0) << 31) | (((BITS_PER_SAMPLE - 1) & 0x1F) << 26) | ((THREAD_ID & 0x3FF) << 16) | (station & 0xFFFF)
+    struct.pack_into('<I', header, 12, word3)
 
     # Remaining header words (4-7) set to zero for simplicity
     return header
 
 def quantize_signal(signal):
-    # 2-bit quantization into [0,1,2,3]
-    #thresholds = np.percentile(signal, [25, 50, 75])
-    #quantized = np.digitize(signal, thresholds, right=True)
-    #return quantized.astype(np.uint8)  # values: 0,1,2,3
-    return np.clip(np.floor(signal), 0, 255).astype(np.uint8)
+    """Quantize the floating point signal into 2-bit samples."""
+    thresholds = np.percentile(signal, [25, 50, 75])
+    quantized = np.digitize(signal, thresholds, right=True)
+    return quantized.astype(np.uint8)
 
 def generate_payload(samples):
     # Pack 2-bit samples into bytes (4 samples per byte)
